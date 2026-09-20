@@ -1,0 +1,413 @@
+# Format-preservation boundary matrix for dotted keys, arrays of tables (AoT)
+# and out-of-order tables.
+#
+# Every case pins exact bytes (not just semantics). Each op describes one
+# mutation (update / delete / reinsert / AoT pop/insert/swap / append) and the
+# case names either an exact expect_bytes output or the only lines allowed to
+# change.
+#
+# Field reference:
+#   id          stable identifier used in the parametrized test node id
+#   description one-line context used in failure messages
+#   toml        input document; a trailing " CRLF" marker on a line (also a
+#               bare "CRLF" line for an empty CRLF line) is converted to a
+#               real carriage return by the loader, so the fixture stays
+#               readable in git and diffs and stores no CR bytes. The single
+#               space before the marker is separator syntax and is dropped.
+#   noop        when true, parse -> dumps with no mutation must be byte-identical
+#   ops         ordered list of mutations:
+#     op: update  path=[...], value=<json-like>
+#     op: delete  path=[...]
+#     op: reinsert path=[...]              (pop then set at the same key)
+#     op: aot_pop path=[...], index=<int>  (AoT.__getitem__(index).pop)
+#     op: aot_insert path=[...], index=<int>  (insert the popped element back)
+#     op: aot_swap path=[...], a=<int>, b=<int>
+#     op: append path=[...], key=<str>, value=<any>
+#   changed_lines: 1-based line numbers that the ops are allowed to change
+#                  (deletions/reinsertions may also *move* content; for those
+#                   use the explicit `expect_bytes` field instead)
+#   expect_bytes: exact expected output (takes precedence over line diffing)
+#   contains    substrings that must appear in the output
+#   absent      substrings that must not appear in the output
+#   reserializes: parse(output).as_string() == output (default true)
+
+cases:
+  - id: noop-dotted-and-explicit
+    description: dotted key shares a prefix with an explicit sibling table
+    toml: |
+      title = "t"
+      servers.alpha.ip = "1.1.1.1"
+      [servers.beta]
+      ip = "2.2.2.2"
+    noop: true
+    ops:
+      - {op: update, path: [title], value: "T"}
+      - {op: update, path: [servers, beta, ip], value: "9.9.9.9"}
+    changed_lines: [1, 4]
+    contains: ['servers.alpha.ip = "1.1.1.1"']
+
+  - id: noop-aot-nested-table
+    description: AoT elements each own a nested subtable with a header
+    toml: |
+      [[products]]
+      name = "p1"
+      [products.info]
+      weight = 1
+
+      [[products]]
+      name = "p2"
+      [products.info]
+      weight = 2
+    noop: true
+    ops:
+      - {op: update, path: [products, 1, info, weight], value: 20}
+    changed_lines: [9]
+    contains:
+      - 'name = "p1"'
+      - '[products.info]'
+      - 'weight = 1'
+
+  - id: noop-child-before-parent
+    description: child table header appears before the parent header
+    toml: |
+      [a.b]
+      x = 1 # child value
+      [a]
+      y = 2 # parent value
+    noop: true
+    ops:
+      - {op: update, path: [a, b, x], value: 11}
+      - {op: update, path: [a, y], value: 22}
+    changed_lines: [2, 4]
+    contains:
+      - "[a.b]"
+      - "[a]"
+
+  - id: noop-crlf-dotted-table-comment
+    description: CRLF document with dotted key, table header and trailing comment
+    toml: |
+      db.host = "localhost" # dotted comment CRLF
+      [db.opts] CRLF
+      timeout = 5 # keep me CRLF
+    noop: true
+    ops:
+      - {op: update, path: [db, opts, timeout], value: 9}
+    changed_lines: [3]
+    contains:
+      - '# dotted comment'
+      - '[db.opts]'
+      - '# keep me'
+
+  - id: crlf-aot-nested-and-comments
+    description: CRLF AoT with nested headers, header/value comments and blank line
+    toml: |
+      # lead comment CRLF
+      [[servers]] # h1 CRLF
+      name = "alpha" # a CRLF
+      [servers.addr] CRLF
+      ip = "1.1.1.1" CRLF
+      CRLF
+      [[servers]] # h2 CRLF
+      name = "beta" CRLF
+    noop: true
+    ops:
+      - {op: update, path: [servers, 0, addr, ip], value: "10.0.0.1"}
+    changed_lines: [5]
+    contains:
+      - '# lead comment'
+      - '[[servers]] # h1'
+      - '# a'
+      - '[servers.addr]'
+      - '[[servers]] # h2'
+
+  - id: delete-reinsert-scalar-between-dotted
+    description: >-
+      pop/readd a scalar; the reinserted value lands in the value region after
+      the dotted siblings, carrying its own trivia, while the surviving dotted
+      lines stay byte-identical
+    toml: |
+      a.x = 1
+      middle = 2
+      a.y = 3
+    ops:
+      - {op: reinsert, path: [middle]}
+    expect_bytes: |
+      a.x = 1
+      a.y = 3
+      middle = 2
+    contains:
+      - 'a.x = 1'
+      - 'a.y = 3'
+      - 'middle = 2'
+
+  - id: delete-reinsert-key-in-explicit-table
+    description: >-
+      del + set at the same key appends the value at the table end and keeps
+      the original item's trivia attached; untouched neighbors are preserved
+    toml: |
+      [s]
+      keep = "k" # comment stays
+      gone = "g" # this comment travels with the value
+      tail = 3
+    ops:
+      - {op: reinsert, path: [s, gone]}
+    expect_bytes: |
+      [s]
+      keep = "k" # comment stays
+      tail = 3
+      gone = "g" # this comment travels with the value
+    contains:
+      - 'gone = "g" # this comment travels with the value'
+
+  - id: aot-pop-and-reinsert-same-slot
+    description: popping an AoT element and inserting it back at the same index
+    toml: |
+      [[p]]
+      x = 1 # one
+      [[p]]
+      x = 2 # two
+      [[p]]
+      x = 3 # three
+    ops:
+      - {op: aot_pop, path: [p], index: 1}
+      - {op: aot_insert, path: [p], index: 1}
+    expect_bytes: |
+      [[p]]
+      x = 1 # one
+      [[p]]
+      x = 2 # two
+      [[p]]
+      x = 3 # three
+
+  - id: aot-swap-elements-keeps-trivia
+    description: reordering AoT elements moves each element with its own trivia
+    toml: |
+      [[p]]
+      x = 1 # first
+      [p.m]
+      k = 1
+
+      [[p]]
+      x = 2 # second
+      [p.m]
+      k = 2
+
+      [[p]]
+      x = 3 # third
+    ops:
+      - {op: aot_swap, path: [p], a: 0, b: 1}
+    expect_bytes: |
+      [[p]]
+      x = 2 # second
+      [p.m]
+      k = 2
+
+      [[p]]
+      x = 1 # first
+      [p.m]
+      k = 1
+
+      [[p]]
+      x = 3 # third
+    contains:
+      - 'x = 2 # second'
+      - 'x = 1 # first'
+
+  - id: aot-delete-middle-leaves-neighbors
+    description: deleting an AoT element keeps every surviving byte elsewhere
+    toml: |
+      # preamble
+      [[p]]
+      x = 1 # survivor-a
+      [p.m]
+      k = 1
+      [[p]]
+      x = 2 # deleted-element
+      [p.m]
+      k = 2
+      [[p]]
+      x = 3 # survivor-c
+      [p.m]
+      k = 3
+    ops:
+      - {op: aot_pop, path: [p], index: 1}
+    expect_bytes: |
+      # preamble
+      [[p]]
+      x = 1 # survivor-a
+      [p.m]
+      k = 1
+      [[p]]
+      x = 3 # survivor-c
+      [p.m]
+      k = 3
+    contains:
+      - '# preamble'
+      - 'x = 1 # survivor-a'
+      - 'x = 3 # survivor-c'
+      - 'k = 3'
+    absent:
+      - 'deleted-element'
+
+  - id: out-of-order-dotted-then-explicit-update
+    description: dotted prefix extended out of order by a later explicit header
+    toml: |
+      servers.alpha.ip = "1.1.1.1" # dotted fragment
+      [servers.beta]
+      ip = "2.2.2.2" # beta comment
+      [servers.alpha]
+      dc = "east"
+    noop: true
+    ops:
+      - {op: update, path: [servers, alpha, dc], value: "west"}
+      - {op: update, path: [servers, beta, ip], value: "8.8.8.8"}
+    changed_lines: [3, 5]
+    contains:
+      - 'servers.alpha.ip = "1.1.1.1" # dotted fragment'
+
+  - id: dotted-mixed-inside-aot-element
+    description: dotted keys and a nested header coexist inside one AoT element
+    toml: |
+      [[p]] # element-one
+      q.r = 1 # dotted in element
+      [p.nested]
+      s = 2
+      [[p]] # element-two
+      q.r = 3
+    noop: true
+    ops:
+      - {op: update, path: [p, 0, q, r], value: 11}
+      - {op: update, path: [p, 0, nested, s], value: 22}
+    changed_lines: [2, 4]
+    contains:
+      - '[[p]] # element-one'
+      - 'q.r = 11 # dotted in element'
+      - '[p.nested]'
+      - 's = 22'
+      - '[[p]] # element-two'
+      - 'q.r = 3'
+
+  - id: update-dotted-value-preserves-crlf-comment
+    description: replacing a dotted scalar value keeps its trail and comment
+    toml: |
+      a.b = 1 # dotted CRLF
+      c = 2 CRLF
+    noop: true
+    ops:
+      - {op: update, path: [a, b], value: 11}
+    changed_lines: [1]
+    contains:
+      - 'a.b = 11 # dotted'
+      - 'c = 2'
+
+  - id: update-last-dotted-value-preserves-final-crlf
+    description: >-
+      replacing the final value of the document keeps its trail and comment;
+      for the last line there is no following indent to carry the CRLF, so the
+      value's own trivia.trail is the only place it can survive
+    toml: |
+      first = 0 # first CRLF
+      last.nested = 1 # final comment CRLF
+    noop: true
+    ops:
+      - {op: update, path: [last, nested], value: 11}
+    expect_bytes: |
+      first = 0 # first CRLF
+      last.nested = 11 # final comment CRLF
+
+  - id: update-last-value-in-final-aot-element-keeps-crlf
+    description: final AoT element value update keeps its trailing CRLF
+    toml: |
+      [[p]] CRLF
+      x = 1 CRLF
+      [[p]] CRLF
+      y = 2 # last one CRLF
+    noop: true
+    ops:
+      - {op: update, path: [p, 1, y], value: 22}
+    expect_bytes: |
+      [[p]] CRLF
+      x = 1 CRLF
+      [[p]] CRLF
+      y = 22 # last one CRLF
+
+  - id: trailing-comment-on-final-aot-element
+    description: last line of the document is an AoT value with a comment, CRLF
+    toml: |
+      [[p]] CRLF
+      x = 1 CRLF
+      [[p]] CRLF
+      x = 2 # final trailing comment CRLF
+    noop: true
+    ops:
+      - {op: update, path: [p, 0, x], value: 10}
+    changed_lines: [2]
+    contains:
+      - 'x = 2 # final trailing comment'
+
+  - id: blank-lines-around-out-of-order-parent
+    description: blank lines and comments survive edits between split tables
+    toml: |
+      # header one
+
+
+      [a.b]
+      x = 1 # child
+
+
+      [a]
+      y = 2 # parent
+    noop: true
+    ops:
+      - {op: update, path: [a, b, x], value: 11}
+    changed_lines: [5]
+    contains:
+      - '# header one'
+      - 'y = 2 # parent'
+
+  - id: delete-key-inside-aot-nested-table
+    description: remove a key inside a nested table of a non-first AoT element
+    toml: |
+      [[p]]
+      x = 1
+      [p.m]
+      keep = "a"
+      drop = "b"
+      [[p]]
+      x = 2
+      [p.m]
+      keep = "c"
+      drop = "d"
+    ops:
+      - {op: delete, path: [p, 1, m, drop]}
+    expect_bytes: |
+      [[p]]
+      x = 1
+      [p.m]
+      keep = "a"
+      drop = "b"
+      [[p]]
+      x = 2
+      [p.m]
+      keep = "c"
+    contains:
+      - 'drop = "b"'
+      - 'keep = "c"'
+    absent:
+      - 'drop = "d"'
+
+  - id: aot-element-move-across-crlf-boundary
+    description: move the last CRLF AoT element to the front and back again
+    toml: |
+      [[p]] CRLF
+      x = 1 # one CRLF
+      [[p]] CRLF
+      x = 2 # two CRLF
+    ops:
+      - {op: aot_pop, path: [p], index: 0}
+      - {op: aot_insert, path: [p], index: 1}
+    expect_bytes: |
+      [[p]] CRLF
+      x = 2 # two CRLF
+      [[p]] CRLF
+      x = 1 # one CRLF

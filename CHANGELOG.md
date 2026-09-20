@@ -1,5 +1,62 @@
 # Change Log
 
+## [Unreleased]
+
+### Tests
+
+- Add format-preservation mutation tests for dotted keys, arrays of tables (AoT) and out-of-order tables in `tests/test_format_preservation.py`, driven by the YAML boundary matrix in `tests/fixtures/format_preservation/boundary_matrix.yaml`. Product semantics are unchanged; this is test coverage only, plus a `[tool.pytest.ini_options]` entry that blocks a broken globally-installed `pytest_ethereum` plugin so plain `pytest` works on machines that have it (a no-op elsewhere).
+
+#### What the suite pins
+
+- **Boundary matrix (19 independently selectable cases).** Each case names a mutation (`update`, `delete`, `reinsert`, `aot_pop`/`aot_insert`, `aot_swap`, `append`) and either an exact `expect_bytes` output or the 1-based `changed_lines` region that is the *only* region allowed to differ; every other line is compared byte-for-byte. Every case first asserts that a bare `parse` -> `dumps` round trip is byte-identical, and then that the mutated output re-parses to a fixed point. CRLF cases are written with a readable `CRLF` end-of-line marker that the loader converts to real carriage returns, so the fixture stays diff-friendly and no literal CR bytes are stored in git.
+- **Generated properties (16 fixed seeds x LF/CRLF).** Deterministically seeded documents mix root scalars with comments, shared-prefix dotted keys, a child-before-parent out-of-order table (`[ooo.child1]` / `[ooo]` / `[ooo.child2]`) and AoT elements with nested `[items.meta]` headers and random blank lines. The properties assert: no-op byte identity; a scalar update changes exactly the one source line rendering that key (comment text and EOL preserved); reversing an AoT permutation moves each element's header/value/meta comments with it exactly once and stays a fixed point; deleting a dotted/scalar line removes exactly that line; and a distant root edit leaves the whole out-of-order + AoT tail byte-identical.
+- **Programmatic-build paths.** Two cases that cannot be reached by mutating parsed input: inserting a built table into the middle of a freshly constructed AoT (blank-line inheritance before the inserted element), and appending a scalar after a parsed dotted super-table that has just gained a child header (`a.b = 1`, then `doc["a"]["c"] = {}`, then `doc["z"] = 2`).
+
+#### Implementation choices
+
+- Fixtures are data, not one big happy-path string: failures report the case `id`, the allowed region, and the before/after bytes of every drifted line, so a red test says which shape and which invariant broke.
+- "Unchanged" is asserted positively (each non-allowed line must be equal), not via a semantic `== dict` comparison — equivalent data with reserialised whitespace/comments/order therefore fails the suite.
+- Generative tests use fixed integer seeds, `random.Random` only, and inline documents; there are no sleeps, network calls, machine absolute paths or fixture-name special cases.
+- The toml-test conformance submodule is expected at the commit pinned by tomlkit 0.15.1 (`08ed8697864548b3cdb4b8decbf496bef47e1c82`); newer toml-test revisions add invalid files (line-tab numbers, Arabic-indic zero digits) this release intentionally does not yet reject.
+
+#### Coverage gap this closes
+
+- Existing tests covered dotted keys, AoT and out-of-order tables mostly as isolated parse/round-trip or build scenarios. They did not combine the features in a single document while mutating it (e.g. update one value inside the second element of a CRLF AoT whose elements carry nested headers, header comments and blank lines) and then assert that *every unrelated byte* survives. CRLF preservation was exercised through the `TOMLFile` re-encoding layer rather than through `parse`/`dumps` trivia, which hid drift on the final line of a document (the last line has no following item whose `indent` can carry the CRLF, so its survival depends entirely on `trivia.trail` being copied).
+
+#### Deliberate-mutation verification
+
+Each of the following one-line source mutants was applied and confirmed to fail only the new tests before being reverted (product tree is clean):
+
+1. Dropping `value.trivia.trail = v.trivia.trail` in `Container._replace_at` -> 18 failures (2 boundary cases and 16 generated cases; final-line CRLF and comments on replaced last values are lost).
+2. Dropping the `prev_table` newline inheritance in `AoT.insert` -> `test_built_aot_insert_inherits_blank_line_before_element` fails (the element boundary's blank separator line disappears, gluing two `[[p]]` headers together).
+3. Removing the dotted-super-table break in `Container._get_last_index_before_table` -> `test_scalar_after_dotted_super_table_with_new_header_stays_at_root` fails.
+
+#### Most dangerous counterexample (mutant 3)
+
+The single most dangerous shape is a **dotted key that renders inline, then gains a child table header, followed by appending a scalar**:
+
+```toml
+a.b = 1
+```
+
+with `doc["a"]["c"] = {}` and then `doc["z"] = 2`. If the insertion boundary in `Container._get_last_index_before_table` ignores a dotted super-table whose child now renders a `[a.c]` header, the output becomes
+
+```toml
+a.b = 1
+
+[a.c]
+z = 2
+```
+
+which re-parses with a *different data model*: `z` is silently captured into table `a.c` (`{'a': {'b': 1, 'c': {'z': 2}}}` instead of `{'a': {'b': 1, 'c': {}}, 'z': 2}`). No semantic equality check can catch this, because the document stays valid TOML on every round-trip and the corruption only shows up as byte/position drift and a wrong unwrapped dict. It is pinned by `test_scalar_after_dotted_super_table_with_new_header_stays_at_root` (exact bytes + reparse semantics + `"z" not in reparsed["a"]["c"]`).
+
+#### Adjacent-semantics regression guards
+
+- The mutated output of every matrix case is re-parsed and must render identically (fixed point), catching invalid-but-tolerated serialisations such as duplicated headers or swallowed separators.
+- Semantic payloads are checked for the reorder/delete cases (AoT element order, surviving keys, absent deleted markers), so a whitespace-preserving but structurally wrong edit cannot sneak through.
+- The `dotted-mixed-inside-aot-element` and `out-of-order-dotted-then-explicit-update` cases use *valid* out-of-order shapes (a sibling table header between the dotted fragment and the later explicit parent header), guarding against tests that "pass" by feeding tomlkit TOML it is supposed to reject.
+
+
 ## [0.15.1] - 2026-07-17
 
 ### Changed

@@ -66,3 +66,11 @@ enable_error_code = [
 [build-system]
 requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+# Some development machines ship a globally installed ``pytest_ethereum``
+# plugin (from the unrelated ``web3`` distribution) that fails to import under
+# newer protobuf runtimes and aborts pytest during startup, before any test is
+# collected.  Blocking it here keeps `pytest` usable; on machines without the
+# plugin the option is a harmless no-op.
+addopts = "-p no:pytest_ethereum"
