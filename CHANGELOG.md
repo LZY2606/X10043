@@ -1,5 +1,36 @@
 # Change Log
 
+## [Unreleased]
+
+### Tests
+
+- Add a format-fidelity mutation suite (`tests/test_format_preservation.py`) for dotted keys, arrays of tables and out-of-order tables. The new tests parse small fixtures, apply local mutations (scalar replacement, delete + reinsert, AoT element move/delete, fragment removal), re-dump and assert byte-level preservation of every unmodified surface line — including indentation, trailing comments, blank separators, declaration order, AoT element boundaries and CRLF endings — with unified-diff diagnostics that carry 1-based line numbers. The suite combines six hand-pinned fixtures (each independently selectable), a parametrized boundary matrix (LF/CRLF x comments x blanks x declaration order x mutation kind x target) and deterministic generative properties over a finite shape space (no randomness, sleeps or network).
+
+### Implementation choices
+
+- **No product-code changes.** The suite pins current behavior of `Container._replace_at` (trivia inheritance), `Container._remove_at` (out-of-order fragment re-indexing), `OutOfOrderTableProxy` (split-AoT fragment merge and write-through), `Table.__copy__` (Container isolation) and the rendering pipeline; all 113 new tests pass against the unchanged library.
+- Fixtures are *minimal and standalone*: each test function constructs its own document inline rather than depending on shared example files, so a single failure points at one shape and one mutation.
+- Fidelity is checked per line with `difflib.SequenceMatcher`, not by whole-document equality: each non-equal hunk must be exactly the one permitted `(old, new)` replacement pair. That makes a mutation that silently normalizes a neighboring comment or moves an unrelated table header fail even when the mutated value itself is correct.
+- CRLF is asserted as purity (`"\r\n"` count equals `"\n"` count) for in-place replacement paths, which inherit trivia verbatim. Delete + reinsert deliberately creates a brand-new item with default (LF) trivia; line-ending normalization there remains the documented job of `TOMLFile` (it stores the detected separator and rewrites on write), so those matrix cases constrain only the surviving lines.
+- Mutation coverage is proven, not asserted: `tests/etc/mutation_audit_format_preservation.py` applies a fixed catalogue of source mutations by source-anchor (not by fixture or test name), runs the new file and the pre-existing suite separately for each, restores the tree, and exits non-zero if any mutation is missed. Current result: 5/5 mutations caught; the trailing-comment/comment_ws inheritance mutation is caught by 42 new tests and by **zero** pre-existing tests, which is the coverage gap this suite closes.
+
+### Coverage gaps in the pre-existing suite
+
+- Replacing a value inside a dotted key, an out-of-order fragment or an AoT element was tested for the new *value* and sometimes for indentation, but not for preservation of the trailing comment/comment whitespace: dropping `trivia.comment` and `trivia.comment_ws` inheritance in `Container._replace_at` left all 1063 pre-existing tests green.
+- There was no single fixture that interleaves a dotted key, an explicit table header, a nested table inside an AoT element, child-before-parent declaration order and CRLF endings in one document and pins every unmodified line after mutation; gaps could therefore hide between per-feature tests.
+- AoT elements split across out-of-order fragments were covered semantically (merge order and write-through), but not for byte-level stability of the interleaved unrelated headers when mutating through the merged proxy.
+
+### Adjacent-semantics regression guards
+
+- Every mutated dump is re-parsed twice: once to assert the specific changed value/structure (`parse(dump)[...]`) and once to assert the dump is a parse/dumps fixpoint, so a fidelity test can never bless syntactically invalid TOML.
+- Declaration-order guards compare the full header sequence before/after, catching implicit reordering of out-of-order fragments even when values stay equal.
+- AoT boundary guards compare the absolute positions of every `[[products]]` header and the byte content of every line belonging to a non-moved element.
+- Fragment-deletion guards assert membership (`"b" not in ...`), readable surviving keys, an exact `unwrap()` payload and JSON serialization, so a wrong index in the tuple re-indexing cannot leave a `Null` tombstone in the merged view.
+
+### The most dangerous counterexample and its regression test
+
+- `test_split_aot_across_out_of_order_fragments` pins the riskiest shape: an AoT whose elements are declared in two *non-adjacent out-of-order fragments* of the same parent table with an unrelated table interleaved between them (`[hooks]` / `[[hooks.step]]` / `[unrelated]` / `[[hooks.step]]` / `[hooks.state]`). Logical access goes through `OutOfOrderTableProxy`, which merges the fragments into one AoT without copying or moving the live element tables; mutation writes back through the proxy to the second live fragment. A regression that reverses fragment merge order, copies trivia onto the merged view, reorders the fragments on write-back, or relocates the interleaved unrelated header either corrupts element semantics or emits TOML whose surface (and sometimes parseability) is wrong. The test pins all four failure modes at once: merge order is checked via the element list, write-through lands on the second fragment, only the one target line may differ byte-for-byte, the interleaved header sequence is asserted exactly, and the result must reparse to the same structure.
+
 ## [0.15.1] - 2026-07-17
 
 ### Changed
